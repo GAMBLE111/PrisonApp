@@ -76,16 +76,12 @@ def main():
         download_all()
         return
 
-    # Check for service account key
-    if not os.path.exists(SERVICE_ACCOUNT_KEY):
-        print(f"[error] Firebase service account key not found: {SERVICE_ACCOUNT_KEY}")
-        print("Download it from Firebase Console > Project Settings > Service Accounts")
-        print(f"Save it as: {SERVICE_ACCOUNT_KEY}")
-        sys.exit(1)
-
-    # Init Firebase
+    # Init Firebase (uses service account key if available, otherwise Firebase CLI token)
     print("Initializing Firebase...")
-    db = init_firebase(SERVICE_ACCOUNT_KEY)
+    db = init_firebase(
+        service_account_path=SERVICE_ACCOUNT_KEY,
+        project_id="prison-app-au",
+    )
 
     # Determine which datasets to import
     if args:

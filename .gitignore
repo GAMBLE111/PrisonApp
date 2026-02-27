@@ -36,6 +36,13 @@ yarn-error.*
 # Firebase
 firebase-debug.log
 
+# Python
+scripts/venv/
+scripts/data/
+scripts/serviceAccountKey.json
+__pycache__/
+*.pyc
+
 # typescript
 *.tsbuildinfo
 

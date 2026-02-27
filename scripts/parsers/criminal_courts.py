@@ -1,122 +1,204 @@
+from __future__ import annotations
 """
 Parser for ABS Criminal Courts dataset.
 
-The ABS Criminal Courts Excel file contains multiple sheets.
-This parser reads data from relevant sheets and extracts structured records.
-
-Note: ABS Excel file layouts change between releases. You may need to adjust
-column indices and sheet names when new data is published. Always inspect the
-downloaded file first to verify the structure.
+ABS file: "Defendants finalised, Australia (Tables 1 to 6)"
+- Table 1: National time series (years as columns, categories as rows)
+- Table 2: State breakdown for latest year (states as columns)
+- Table 3: Sex × Age × Offence cross-tab for latest year
 """
 
 import openpyxl
 from typing import List, Dict, Any
 
+# Standard state column headers used by ABS
+STATE_COLUMNS = ["NSW", "Vic.", "Qld", "SA", "WA", "Tas.", "NT", "ACT", "Aust."]
+
 
 def parse(filepath: str) -> List[Dict[str, Any]]:
-    """
-    Parse the Criminal Courts Excel file into a list of records.
-
-    Each record represents one row of data with fields:
-    state, year, courtLevel, offenceCategory, sex, ageGroup, sentenceType, count
-    """
+    """Parse the Criminal Courts Excel file into flat records."""
     records: List[Dict[str, Any]] = []
     wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
 
-    # Try to find data sheets — ABS files vary in structure
-    for sheet_name in wb.sheetnames:
-        sheet = wb[sheet_name]
-        rows = list(sheet.iter_rows(values_only=True))
+    # Parse Table 1 for national time series
+    if "Table 1" in wb.sheetnames:
+        records.extend(_parse_time_series(wb["Table 1"]))
 
-        if len(rows) < 5:
-            continue
-
-        # Look for header row by scanning for common column names
-        header_row = None
-        header_idx = -1
-        for i, row in enumerate(rows[:20]):
-            row_str = " ".join(str(c).lower() for c in row if c)
-            if "offence" in row_str or "sentence" in row_str:
-                header_row = row
-                header_idx = i
-                break
-
-        if header_row is None:
-            continue
-
-        # Map column indices
-        col_map = _map_columns(header_row)
-        if not col_map:
-            continue
-
-        # Parse data rows
-        for row in rows[header_idx + 1:]:
-            if not row or all(c is None for c in row):
-                continue
-
-            record = _parse_row(row, col_map, sheet_name)
-            if record and record.get("count", 0) > 0:
-                records.append(record)
+    # Parse Table 2 for state-level breakdowns (latest year)
+    if "Table 2" in wb.sheetnames:
+        records.extend(_parse_state_breakdown(wb["Table 2"]))
 
     wb.close()
     print(f"  Parsed {len(records)} criminal courts records")
     return records
 
 
-def _map_columns(header_row) -> Dict[str, int]:
-    """Map column names to indices."""
-    col_map = {}
-    for i, cell in enumerate(header_row):
-        if cell is None:
+def _parse_time_series(sheet) -> List[Dict[str, Any]]:
+    """Parse Table 1: national time series with years as columns."""
+    records = []
+    rows = list(sheet.iter_rows(values_only=True))
+
+    # Find header row with year columns
+    years = []
+    header_idx = -1
+    for i, row in enumerate(rows[:10]):
+        year_cols = []
+        for j, cell in enumerate(row):
+            if cell and "–" in str(cell) and len(str(cell)) <= 10:
+                year_cols.append((j, str(cell).strip()))
+        if len(year_cols) >= 5:
+            years = year_cols
+            header_idx = i
+            break
+
+    if not years:
+        return records
+
+    # Parse category rows
+    current_category = None
+    for row in rows[header_idx + 1:]:
+        if not row:
             continue
-        name = str(cell).lower().strip()
 
-        if "state" in name or "territory" in name:
-            col_map["state"] = i
-        elif "year" in name:
-            col_map["year"] = i
-        elif "court" in name and "level" in name:
-            col_map["courtLevel"] = i
-        elif "offence" in name:
-            col_map["offenceCategory"] = i
-        elif "sex" in name:
-            col_map["sex"] = i
-        elif "age" in name:
-            col_map["ageGroup"] = i
-        elif "sentence" in name and "type" in name:
-            col_map["sentenceType"] = i
-        elif "number" in name or "count" in name or name == "no.":
-            col_map["count"] = i
+        label = str(row[0]).strip() if row[0] else ""
+        if not label:
+            continue
 
-    return col_map
+        # Detect category headers (Sex, Age, Principal offence, etc.)
+        if label in ("Sex", "Age", "Principal offence(a)", "Principal offence",
+                      "Court level", "Method of finalisation", "Sentence type"):
+            current_category = label.replace("(a)", "").strip()
+            continue
+
+        # Skip aggregate/summary labels
+        if label.startswith("Total") or label.startswith("Mean") or label.startswith("Median"):
+            continue
+
+        # Extract counts for each year
+        for col_idx, year_label in years:
+            val = row[col_idx] if col_idx < len(row) else None
+            count = _safe_int(val)
+            if count is None or count <= 0:
+                continue
+
+            record = {
+                "state": "Australia",
+                "year": year_label,
+                "count": count,
+            }
+
+            # Assign to the right field based on category
+            if current_category == "Sex":
+                record["sex"] = label
+            elif current_category == "Age":
+                record["ageGroup"] = label
+            elif current_category in ("Principal offence", "Principal offence(a)"):
+                record["offenceCategory"] = label
+            elif current_category == "Court level":
+                record["courtLevel"] = label
+            elif current_category == "Method of finalisation":
+                record["sentenceType"] = label
+            else:
+                record["sex"] = label  # fallback
+
+            records.append(record)
+
+    return records
 
 
-def _parse_row(row, col_map: Dict[str, int], sheet_name: str) -> Dict[str, Any] | None:
-    """Parse a single data row into a record dict."""
+def _parse_state_breakdown(sheet) -> List[Dict[str, Any]]:
+    """Parse Table 2: state-level breakdown for the latest year."""
+    records = []
+    rows = list(sheet.iter_rows(values_only=True))
 
-    def get(field: str, default="Unknown"):
-        idx = col_map.get(field)
-        if idx is None or idx >= len(row):
-            return default
-        val = row[idx]
-        return str(val).strip() if val is not None else default
+    # Find header row with state columns
+    states = []
+    header_idx = -1
+    for i, row in enumerate(rows[:10]):
+        state_cols = []
+        for j, cell in enumerate(row):
+            if cell and str(cell).strip() in STATE_COLUMNS:
+                state_cols.append((j, str(cell).strip()))
+        if len(state_cols) >= 6:
+            states = state_cols
+            header_idx = i
+            break
 
-    count_val = get("count", "0")
+    if not states:
+        return records
+
+    # Determine the year from the sheet title area
+    year = "2023–24"
+    for row in rows[:5]:
+        for cell in row:
+            if cell and "–" in str(cell) and ("20" in str(cell)):
+                candidate = str(cell).strip()
+                # Extract year pattern like "2023-24"
+                import re
+                match = re.search(r"20\d{2}[–-]\d{2}", candidate)
+                if match:
+                    year = match.group()
+                    break
+
+    current_category = None
+    for row in rows[header_idx + 1:]:
+        if not row:
+            continue
+
+        label = str(row[0]).strip() if row[0] else ""
+        if not label:
+            continue
+
+        # Category headers
+        if label in ("Sex", "Age", "Principal offence(a)", "Principal offence",
+                      "Court level", "Method of finalisation"):
+            current_category = label.replace("(a)", "").strip()
+            continue
+
+        if label.startswith("Total") or label.startswith("Mean") or label.startswith("Median"):
+            continue
+        if label == "All Courts":
+            continue
+
+        # Extract count for each state
+        for col_idx, state_name in states:
+            if state_name == "Aust.":
+                continue  # skip national total, already in Table 1
+
+            val = row[col_idx] if col_idx < len(row) else None
+            count = _safe_int(val)
+            if count is None or count <= 0:
+                continue
+
+            record = {
+                "state": state_name,
+                "year": year,
+                "count": count,
+            }
+
+            if current_category == "Sex":
+                record["sex"] = label
+            elif current_category == "Age":
+                record["ageGroup"] = label
+            elif current_category in ("Principal offence", "Principal offence(a)"):
+                record["offenceCategory"] = label
+            elif current_category == "Court level":
+                record["courtLevel"] = label
+            elif current_category == "Method of finalisation":
+                record["sentenceType"] = label
+            else:
+                record["sex"] = label
+
+            records.append(record)
+
+    return records
+
+
+def _safe_int(val) -> int | None:
+    """Safely convert a cell value to int."""
+    if val is None:
+        return None
     try:
-        count = int(float(count_val))
+        return int(float(str(val).replace(",", "").replace(" ", "")))
     except (ValueError, TypeError):
         return None
-
-    if count <= 0:
-        return None
-
-    return {
-        "state": get("state"),
-        "year": get("year"),
-        "courtLevel": get("courtLevel"),
-        "offenceCategory": get("offenceCategory"),
-        "sex": get("sex"),
-        "ageGroup": get("ageGroup"),
-        "sentenceType": get("sentenceType"),
-        "count": count,
-    }
